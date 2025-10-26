@@ -1,0 +1,479 @@
+<!DOCTYPE html>
+<html lang="en">
+
+<head>
+    <meta charset="utf-8" />
+    <title>Teacher Panel — Unified Firestore</title>
+    <meta name="viewport" content="width=device-width,initial-scale=1" />
+    <style>
+        body {
+            font-family: system-ui, sans-serif;
+            margin: 0;
+            background: #f4f6fb;
+            padding: 18px;
+            color: #111
+        }
+
+        header {
+            background: #3f51b5;
+            color: #fff;
+            padding: 14px;
+            border-radius: 8px;
+            text-align: center;
+            font-weight: 700
+        }
+
+        .card {
+            background: #fff;
+            padding: 14px;
+            border-radius: 8px;
+            margin-top: 16px;
+            box-shadow: 0 1px 4px rgba(0, 0, 0, 0.06)
+        }
+
+        input,
+        textarea,
+        select {
+            display: block;
+            margin: 8px 0;
+            padding: 8px;
+            border-radius: 6px;
+            border: 1px solid #ccc;
+            width: 100%
+        }
+
+        .btn {
+            display: inline-block;
+            padding: 8px 12px;
+            border-radius: 6px;
+            border: 0;
+            font-weight: 600;
+            cursor: pointer;
+            margin: 4px
+        }
+
+        .btn.primary {
+            background: #3f51b5;
+            color: white
+        }
+
+        .btn.secondary {
+            background: #3f51b5;
+            color: white
+        }
+
+        .question {
+            padding: 12px;
+            border-radius: 6px;
+            background: #fbfcff;
+            border: 1px solid #e6e9fb;
+            margin-top: 8px;
+            position: relative
+        }
+
+        .test-item {
+            border-bottom: 1px solid #eee;
+            padding: 8px 0
+        }
+
+        .small {
+            font-size: 13px;
+            color: #666
+        }
+    </style>
+</head>
+
+<body>
+    <header>🧑‍🏫 Teacher Panel (Firestore)</header>
+
+    <div class="card" id="authCard">
+        <div id="authStatus">Checking auth...</div>
+        <button class="btn primary" id="signOutBtn" style="display:none">Sign out</button>
+    </div>
+
+    <div class="card" id="controls" style="display:none">
+        <button class="btn primary" onclick="showTestForm()">➕ New Test</button>
+        <button class="btn secondary" onclick="loadTests()">Refresh Tests</button>
+        <div id="teacherNote" class="small">Tip: Tests are saved under collection <code>tests</code>. Use generated
+            codes as doc IDs.</div>
+    </div>
+
+    <div class="card" id="testListCard" style="display:none">
+        <h3>All Tests</h3>
+        <div id="testList"></div>
+    </div>
+
+    <div class="card" id="testForm" style="display:none">
+        <h3 id="formTitle">Create / Edit Test</h3>
+        <input id="testTitle" placeholder="Test Title" />
+        <textarea id="testDescription" placeholder="Description (optional)"></textarea>
+        <input id="testDuration" type="number" placeholder="Duration (minutes)" />
+        <label>Publish At: <input id="publishAt" type="datetime-local" /></label>
+        <label>Expire At: <input id="expireAt" type="datetime-local" /></label>
+        <select id="accessMode">
+            <option value="private">Private</option>
+            <option value="public">Public</option>
+        </select>
+        <input id="generatedCode" placeholder="Generated Test Code" readonly />
+        <div style="margin-top:8px">
+            <button class="btn primary" onclick="generateTestCode()">Generate Code</button>
+            <button class="btn secondary" onclick="copyCode()">Copy Code</button>
+            <button class="btn secondary" onclick="addQuestion()">Add Question</button>
+        </div>
+        <div id="questionList"></div>
+        <div style="margin-top:8px">
+            <button class="btn primary" onclick="saveTest()">💾 Save Test</button>
+            <button class="btn secondary" onclick="publishToggle()">Publish / Unpublish</button>
+            <button class="btn secondary" onclick="gradeAuto()">Auto-Grade MCQs</button>
+        </div>
+        <div id="saveStatus" class="small"></div>
+    </div>
+
+    <script type="module">
+        // Firebase modular imports
+        import { initializeApp } from "https://www.gstatic.com/firebasejs/10.8.1/firebase-app.js";
+        import { getAuth, onAuthStateChanged, signOut } from "https://www.gstatic.com/firebasejs/10.8.1/firebase-auth.js";
+        import {
+            getFirestore, doc, setDoc, getDoc, getDocs, collection, query, where,
+            deleteDoc, updateDoc, serverTimestamp, onSnapshot
+        } from "https://www.gstatic.com/firebasejs/10.8.1/firebase-firestore.js";
+
+        // --- CONFIG: replace with your firebaseConfig if different ---
+        const firebaseConfig = {
+            apiKey: "AIzaSyAFKmM22FUSQPYy-eMsBzcZN3bmAxglXl0",
+            authDomain: "smart-timetable-266fe.firebaseapp.com",
+            projectId: "smart-timetable-266fe",
+            storageBucket: "smart-timetable-266fe.appspot.com",
+            messagingSenderId: "843230713835",
+            appId: "1:843230713835:web:b97d024f4fcf9a40ceabae",
+            measurementId: "G-DDY9NVEK8R"
+        };
+
+        const app = initializeApp(firebaseConfig);
+        const auth = getAuth(app);
+        const db = getFirestore(app);
+
+        // --- role detection: prefer users/{uid}.role, accept "teacher" OR "faculty"
+        async function getRole(uid, email) {
+            try {
+                const uDoc = await getDoc(doc(db, "users", uid));
+                if (uDoc.exists()) {
+                    const r = (uDoc.data().role || "").toString().toLowerCase();
+                    if (r === "teacher" || r === "faculty") return "teacher"; // treat faculty as teacher
+                    if (r) return r; // other roles (student, admin, etc.)
+                }
+            } catch (e) {
+                console.warn("role read failed", e);
+            }
+            // fallback: detect common keywords in email
+            if (email && /teacher|faculty|staff/i.test(email)) return "teacher";
+            return "student";
+        }
+
+        // Auth handling
+        onAuthStateChanged(auth, async user => {
+            const authStatus = document.getElementById("authStatus");
+            const signOutBtn = document.getElementById("signOutBtn");
+            if (!user) {
+                authStatus.innerHTML = 'Not signed in — open this page after signing in.';
+                document.getElementById("controls").style.display = "none";
+                document.getElementById("testListCard").style.display = "none";
+                document.getElementById("testForm").style.display = "none";
+                signOutBtn.style.display = "none";
+                return;
+            }
+            signOutBtn.style.display = "inline-block";
+            signOutBtn.onclick = () => signOut(auth);
+            authStatus.innerHTML = `Signed in as <strong>${user.email}</strong>`;
+            const role = await getRole(user.uid, user.email);
+            if (role !== "teacher") {
+                authStatus.innerHTML += `<br><span style="color:crimson">Access denied — you are not a teacher.</span>`;
+                document.getElementById("controls").style.display = "none";
+                document.getElementById("testListCard").style.display = "none";
+                document.getElementById("testForm").style.display = "none";
+                return;
+            }
+            // show teacher UI
+            document.getElementById("controls").style.display = "block";
+            document.getElementById("testListCard").style.display = "block";
+            loadTests();
+        });
+
+        // UI state
+        let questions = []; // array of indexes used to build form
+        let editingCode = null;
+
+        // Utility: generate code
+        window.generateTestCode = function () {
+            const chars = "ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789";
+            let code = "TEST-";
+            for (let i = 0; i < 5; i++) code += chars.charAt(Math.floor(Math.random() * chars.length));
+            document.getElementById("generatedCode").value = code;
+        };
+        window.copyCode = function () { navigator.clipboard.writeText(document.getElementById("generatedCode").value || ""); alert("Copied!") };
+
+        window.showTestForm = function () {
+            document.getElementById("testForm").style.display = "block";
+            document.getElementById("formTitle").innerText = "Create / Edit Test";
+            window.scrollTo({ top: 0, behavior: "smooth" });
+        };
+
+        // add question input
+        window.addQuestion = function () {
+            const idx = questions.length ? Math.max(...questions) + 1 : 0;
+            questions.push(idx);
+            const container = document.createElement("div");
+            container.className = "question";
+            container.id = `question_${idx}`;
+            container.innerHTML = `
+      <button style="position:absolute;right:8px;top:8px" onclick="deleteQuestion(${idx})">✖</button>
+      <strong>Question ${idx + 1}</strong>
+      <textarea id="q${idx}_text" placeholder="Question text"></textarea>
+      <select id="q${idx}_type" onchange="toggleOptions(${idx})"><option value="mcq">MCQ</option><option value="text">Text</option></select>
+      <div id="q${idx}_options">
+        <input id="q${idx}_opt0" placeholder="Option A" />
+        <input id="q${idx}_opt1" placeholder="Option B" />
+        <input id="q${idx}_opt2" placeholder="Option C" />
+        <input id="q${idx}_opt3" placeholder="Option D" />
+      </div>
+      <input id="q${idx}_answer" placeholder="Correct Answer (exact match for MCQ)" />
+      <input id="q${idx}_marks" type="number" placeholder="Marks (default 1)" />
+    `;
+            document.getElementById("questionList").appendChild(container);
+        };
+
+        window.deleteQuestion = function (index) {
+            const el = document.getElementById(`question_${index}`);
+            if (el) el.remove();
+            questions = questions.filter(i => i !== index);
+        };
+
+        window.toggleOptions = function (index) {
+            const t = document.getElementById(`q${index}_type`).value;
+            const optDiv = document.getElementById(`q${index}_options`);
+            optDiv.style.display = t === "mcq" ? "block" : "none";
+        };
+
+        // Save test (create or update)
+        window.saveTest = async function () {
+            const code = document.getElementById("generatedCode").value.trim();
+            const title = document.getElementById("testTitle").value.trim();
+            const description = document.getElementById("testDescription").value.trim();
+            const duration = parseInt(document.getElementById("testDuration").value) || 0;
+            const publishAt = document.getElementById("publishAt").value;
+            const expireAt = document.getElementById("expireAt").value;
+            const accessMode = document.getElementById("accessMode").value;
+
+            if (!code || !title || !publishAt || !expireAt) {
+                document.getElementById("saveStatus").textContent = "Please fill title, code, publish and expire times.";
+                return;
+            }
+            // build question array
+            const qList = questions.map(i => {
+                const q = {
+                    text: document.getElementById(`q${i}_text`).value.trim(),
+                    type: document.getElementById(`q${i}_type`).value,
+                    marks: parseInt(document.getElementById(`q${i}_marks`).value) || 1,
+                    answer: (document.getElementById(`q${i}_answer`)?.value || "").trim()
+                };
+                if (q.type === "mcq") {
+                    q.options = [
+                        document.getElementById(`q${i}_opt0`).value.trim(),
+                        document.getElementById(`q${i}_opt1`).value.trim(),
+                        document.getElementById(`q${i}_opt2`).value.trim(),
+                        document.getElementById(`q${i}_opt3`).value.trim()
+                    ];
+                }
+                return q;
+            });
+
+            const payload = {
+                title, description, duration, publishAt, expireAt, accessMode,
+                questions: qList, createdAt: serverTimestamp(), createdBy: (auth.currentUser?.uid || "unknown"),
+                published: false, resultsPublished: false
+            };
+
+            try {
+                await setDoc(doc(db, "tests", code), payload);
+                document.getElementById("saveStatus").textContent = `Saved test ${code}`;
+                editingCode = code;
+                loadTests();
+            } catch (e) {
+                console.error(e);
+                document.getElementById("saveStatus").textContent = "Save failed";
+            }
+        };
+
+        // Load tests list
+        window.loadTests = async function () {
+            const list = document.getElementById("testList");
+            list.innerHTML = "<em>Loading…</em>";
+            try {
+                const snap = await getDocs(collection(db, "tests"));
+                list.innerHTML = "<h4>Created Tests</h4>";
+                if (snap.empty) { list.innerHTML += "<p>No tests found</p>"; return; }
+                snap.forEach(docSnap => {
+                    const data = docSnap.data();
+                    const code = docSnap.id;
+                    const div = document.createElement("div");
+                    div.className = "test-item";
+                    div.innerHTML = `
+          <strong>${data.title}</strong> <span class="small">(${code})</span><br>
+          <span class="small">Duration: ${data.duration}m • Published: ${data.published ? "Yes" : "No"} • Results: ${data.resultsPublished ? "Published" : "Hidden"}</span><br>
+          <button class="btn secondary" onclick="editTest('${code}')">Edit</button>
+          <button class="btn secondary" onclick="deleteTest('${code}')">Delete</button>
+          <button class="btn secondary" onclick="togglePublish('${code}', ${data.published ? "false" : "true"})">${data.published ? "Unpublish" : "Publish"}</button>
+          <button class="btn secondary" onclick="viewResponses('${code}')">View Responses</button>
+        `;
+                    list.appendChild(div);
+                });
+            } catch (e) {
+                console.error(e);
+                list.innerHTML = "<p>Failed to load tests</p>";
+            }
+        };
+
+        // Edit an existing test
+        window.editTest = async function (code) {
+            const snap = await getDoc(doc(db, "tests", code));
+            if (!snap.exists()) return alert("Not found");
+            const data = snap.data();
+            editingCode = code;
+            document.getElementById("generatedCode").value = code;
+            document.getElementById("testTitle").value = data.title || "";
+            document.getElementById("testDescription").value = data.description || "";
+            document.getElementById("testDuration").value = data.duration || "";
+            document.getElementById("publishAt").value = data.publishAt || "";
+            document.getElementById("expireAt").value = data.expireAt || "";
+            document.getElementById("accessMode").value = data.accessMode || "private";
+            // clear and populate questions
+            document.getElementById("questionList").innerHTML = "";
+            questions = [];
+            (data.questions || []).forEach((q, i) => {
+                addQuestion();
+                document.getElementById(`q${i}_text`).value = q.text || "";
+                document.getElementById(`q${i}_type`).value = q.type || "mcq";
+                document.getElementById(`q${i}_marks`).value = q.marks || 1;
+                document.getElementById(`q${i}_answer`).value = q.answer || "";
+                if (q.type === "mcq") {
+                    document.getElementById(`q${i}_opt0`).value = q.options?.[0] || "";
+                    document.getElementById(`q${i}_opt1`).value = q.options?.[1] || "";
+                    document.getElementById(`q${i}_opt2`).value = q.options?.[2] || "";
+                    document.getElementById(`q${i}_opt3`).value = q.options?.[3] || "";
+                } else {
+                    document.getElementById(`q${i}_options`).style.display = "none";
+                }
+            });
+            showTestForm();
+        };
+
+        // Delete test
+        window.deleteTest = async function (code) {
+            if (!confirm("Delete test?")) return;
+            await deleteDoc(doc(db, "tests", code));
+            loadTests();
+        };
+
+        // toggle published field
+        window.togglePublish = async function (code, toPublish) {
+            await updateDoc(doc(db, "tests", code), { published: Boolean(toPublish) });
+            loadTests();
+        };
+
+        // publish/unpublish toggle for editing view
+        window.publishToggle = async function () {
+            const code = document.getElementById("generatedCode").value.trim();
+            if (!code) return alert("Provide code");
+            const snap = await getDoc(doc(db, "tests", code));
+            if (!snap.exists()) return alert("No such test");
+            const now = snap.data().published ? false : true;
+            await updateDoc(doc(db, "tests", code), { published: now });
+            document.getElementById("saveStatus").textContent = `Published: ${now}`;
+            loadTests();
+        };
+
+        // View responses for a test
+        window.viewResponses = async function (code) {
+            // open a simple popup with response list (basic)
+            const q = query(collection(db, "responses"), where("testId", "==", code));
+            const snap = await getDocs(q);
+            let html = `<h3>Responses for ${code}</h3>`;
+            if (snap.empty) html += "<p>No responses yet</p>";
+            snap.forEach(rs => {
+                const r = rs.data();
+                html += `<div style="border-top:1px solid #eee;padding:8px">
+        <strong>${r.studentName || r.studentId}</strong> — submitted: ${r.submittedAt?.toDate ? r.submittedAt.toDate().toLocaleString() : r.submittedAt}
+        <br>AutoScore: ${r.autoScore ?? 0} • Manual: ${r.manualScore ?? "—"} • Graded: ${r.graded ? "Yes" : "No"}
+        <br><button onclick="openResponse('${rs.id}','${code}')">Open</button>
+      </div>`;
+            });
+            const w = window.open("", "_blank", "width=700,height=600");
+            w.document.write(html);
+        };
+
+        // Open single response for grading
+        window.openResponse = async function (docId, code) {
+            const rsnap = await getDoc(doc(db, "responses", docId));
+            if (!rsnap.exists()) return alert("not found");
+            const r = rsnap.data();
+            const tsnap = await getDoc(doc(db, "tests", code));
+            if (!tsnap.exists()) return alert("test missing");
+            const t = tsnap.data();
+
+            // build grading UI in new window
+            const w = window.open("", "_blank", "width=700,height=700");
+            let html = `<h2>Grade: ${r.studentName || r.studentId}</h2>`;
+            html += `<form id="gradeForm">`;
+            t.questions.forEach((q, i) => {
+                const ans = r.answers?.[`q${i}`] ?? "";
+                html += `<div style="border:1px solid #eee;padding:8px;margin:8px">
+        <strong>Q${i + 1} (${q.marks}):</strong> <div>${q.text}</div><div><em>Answer:</em> ${ans}</div>
+        <label>Manual points (if any): <input id="man_${i}" type="number" value="${q.type === 'mcq' ? 0 : 0}" /></label>
+      </div>`;
+            });
+            html += `<label>Total manual score: <input id="manualTotal" type="number" /></label>`;
+            html += `<button type="button" id="saveBtn">Save Grades</button></form>`;
+            w.document.write(html);
+
+            // wire save
+            w.document.getElementById("saveBtn").onclick = async () => {
+                const manual = Number(w.document.getElementById("manualTotal").value) || 0;
+                await updateDoc(doc(db, "responses", docId), { manualScore: manual, graded: true });
+                alert("Saved");
+                w.close();
+            };
+        };
+
+        // Auto-grade MCQs across responses for a test (teacher action)
+        window.gradeAuto = async function () {
+            const code = document.getElementById("generatedCode").value.trim();
+            if (!code) return alert("Enter code to auto-grade responses for");
+            const tSnap = await getDoc(doc(db, "tests", code));
+            if (!tSnap.exists()) return alert("test not found");
+            const t = tSnap.data();
+            // fetch responses
+            const rsnap = await getDocs(query(collection(db, "responses"), where("testId", "==", code)));
+            let updates = 0;
+            for (const rDoc of rsnap.docs) {
+                const r = rDoc.data();
+                // compute autoScore
+                let auto = 0;
+                let totalPossible = 0;
+                (t.questions || []).forEach((q, i) => {
+                    totalPossible += (q.marks || 0);
+                    if (q.type === "mcq") {
+                        const studentAns = (r.answers?.[`q${i}`] || "").trim();
+                        if (studentAns && q.answer && studentAns === q.answer) auto += (q.marks || 0);
+                    }
+                });
+                await updateDoc(rDoc.ref, { autoScore: auto, totalPossible, graded: false });
+                updates++;
+            }
+            alert(`Auto-graded ${updates} responses`);
+        };
+
+        // END
+    </script>
+</body>
+
+</html>
